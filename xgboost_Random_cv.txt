@@ -2,7 +2,7 @@ library(readxl)
 library(xgboost)
 
 # Phenotypic data
-pheno_raw <- read_excel("Pheno_BLUEs_136.xlsx")
+pheno_raw <- read_excel("Pheno_BLUEs.xlsx")
 
 traits <- c("FL", "R", "G", "B", "L", "a", "b", "RAB", "Hue","ANT", "MO", "SUC", "GLU", "FRU", "RSGFS", "OXA", "CIT", "TAR", "MAL", "SUI", "FUM")
 
