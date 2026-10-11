@@ -1,0 +1,138 @@
+library(readxl)
+library(xgboost)
+
+# Phenotypic data
+pheno_raw <- read_excel("Pheno_BLUEs_136.xlsx")
+
+traits <- c("FL", "R", "G", "B", "L", "a", "b", "RAB", "Hue","ANT", "MO", "SUC", "GLU", "FRU", "RSGFS", "OXA", "CIT", "TAR", "MAL", "SUI", "FUM")
+
+pheno_raw[traits] <- lapply(pheno_raw[traits], function(x) as.numeric(as.character(x)))
+
+Pheno <- as.matrix(pheno_raw[, -1])
+rownames(Pheno) <- pheno_raw$Variety
+
+# Genotypic Data preprocessing & intersecting
+geno_raw <- as.matrix(read.table("SNPs_filtered_conv.csv", header = TRUE, sep = ",", dec = "."))
+geno_raw <- geno_raw[, -1]
+
+markers <- geno_raw[, 1]
+geno_mat <- geno_raw[, -1]
+geno_mat <- apply(geno_mat, 2, as.numeric)
+rownames(geno_mat) <- markers
+geno_transposed <- t(geno_mat)
+
+ind_metadata <- read_excel("157_indivs_overlap.xlsx", col_names = TRUE)
+rownames(geno_transposed) <- ind_metadata$Ind 
+
+geno_df <- as.data.frame(geno_transposed)
+geno_df <- geno_df[rownames(geno_df) %in% rownames(Pheno), ]
+
+sampled_snps <- read.table("sampled_SNPs_10.txt", header = FALSE)
+sampled_snps <- sampled_snps[, -1]
+names(sampled_snps) <- c("Chromosome", "SNP", "Position")
+sampled_snps$SNP <- gsub("-", "_", sampled_snps$SNP)
+
+geno_filtered <- as.matrix(geno_df[, colnames(geno_df) %in% sampled_snps$SNP])
+geno_filtered <- apply(geno_filtered, 2, as.numeric)
+rownames(geno_filtered) <- rownames(Pheno)
+
+# SNP imputation
+geno_imputed <- apply(geno_filtered, 2, function(x) {
+  x[is.na(x)] <- mean(x, na.rm = TRUE)
+  return(x)
+})
+X_geno <- geno_imputed
+
+# Cross-validation & grid search settings
+traits <- colnames(Pheno)[1:10] 
+cycles <- 100                          
+
+# Hyperparameter grid definition
+param_grid <- expand.grid(
+  max_depth = c(3, 6),
+  eta = c(0.05, 0.1)
+)
+
+for (trait_name in traits) {
+  y_vec <- Pheno[, trait_name]
+  total_samples <- length(y_vec)
+  test_size <- round(total_samples * 0.20) 
+  
+
+  accuracy  <- matrix(NA, nrow = cycles, ncol = 1)
+  mse       <- matrix(NA, nrow = cycles, ncol = 1)
+  bias      <- matrix(NA, nrow = cycles, ncol = 1)
+  rel_mse   <- matrix(NA, nrow = cycles, ncol = 1)
+  bias_std  <- matrix(NA, nrow = cycles, ncol = 1)
+  mse_std   <- matrix(NA, nrow = cycles, ncol = 1)
+  
+  runtime <- system.time({
+    for (r in 1:cycles) {
+      
+      # Random 80/20 split
+      tst <- sample(1:total_samples, size = test_size, replace = FALSE)
+      trn <- setdiff(1:total_samples, tst)
+      
+      valid_trn <- trn[!is.na(y_vec[trn])]
+      valid_tst <- tst[!is.na(y_vec[tst])]
+      
+      dtrain <- xgb.DMatrix(data = X_geno[valid_trn, ], label = y_vec[valid_trn])
+      dtest  <- xgb.DMatrix(data = X_geno[valid_tst, ], label = y_vec[valid_tst])
+      
+      # Grid search
+      best_mse <- Inf
+      best_params <- list(max_depth = 3, eta = 0.1)
+      
+      for (g in 1:nrow(param_grid)) {
+        cv_model <- xgb.cv(
+          params = list(objective = "reg:squarederror", 
+                        max_depth = param_grid$max_depth[g], 
+                        eta = param_grid$eta[g]),
+          data = dtrain,
+          nrounds = 50,
+          nfold = 3,
+          verbose = FALSE,
+          prediction = FALSE
+        )
+        min_cv_mse <- min(cv_model$evaluation_log$test_rmse_mean)^2
+        if (min_cv_mse < best_mse) {
+          best_mse <- min_cv_mse
+          best_params <- list(max_depth = param_grid$max_depth[g], eta = param_grid$eta[g])
+        }
+      }
+      
+      # Train final model using the selected ideal hyperparameters
+      final_model <- xgboost(
+        data = dtrain,
+        params = list(objective = "reg:squarederror", 
+                      max_depth = best_params$max_depth, 
+                      eta = best_params$eta),
+        nrounds = 100,
+        verbose = FALSE
+      )
+      
+      # Predictions on the masked testing set
+      y_hat_tst  <- predict(final_model, dtest)
+      y_true_tst <- y_vec[valid_tst]
+      
+      var_y <- var(y_true_tst, na.rm = TRUE)
+      sd_y  <- sd(y_true_tst, na.rm = TRUE)
+      
+      accuracy[r, 1]  <- cor(y_hat_tst, y_true_tst, use = "complete.obs")
+      mse[r, 1]       <- mean((y_true_tst - y_hat_tst)^2, na.rm = TRUE)
+      bias[r, 1]      <- mean(y_true_tst - y_hat_tst, na.rm = TRUE)
+      rel_mse[r, 1]   <- mse[r, 1] / var_y
+      bias_std[r, 1]  <- bias[r, 1] / sd_y
+      mse_std[r, 1]   <- mse[r, 1] / sd_y
+    }
+  })
+
+  
+write.table(accuracy, "xgboost_Random_cv_accuracy.txt", sep=" ", quote=F, col.names=F, row.names=T)
+write.table(mse, "xgboost_Random_cv_mse.txt", sep=" ", quote=F, col.names=F, row.names=T)
+write.table(rel_mse, "xgboost_Random_cv_rel_mse.txt", sep=" ", quote=F, col.names=F, row.names=T)
+write.table(bias, "xgboost_Random_cv_bias.txt", sep=" ", quote=F, col.names=F, row.names=T)
+write.table(bias_std, "xgboost_Random_cv_bias_std.txt", sep=" ", quote=F, col.names=F, row.names=T)
+write.table(mse_std, "xgboost_Random_cv_mse_std.txt", sep=" ", quote=F, col.names=F, row.names=T)
+
+}
